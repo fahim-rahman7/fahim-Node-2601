@@ -17,6 +17,32 @@ const userSchema = new mongoose.Schema(
     password: {
       type: String,
       required: true,
+      select: false,
+    },
+    address: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    bio: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    phone: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    profilePicture: {
+      url: {
+        type: String,
+        default: '',
+      },
+      publicId: {
+        type: String,
+        default: '',
+      },
     },
   },
   { timestamps: true }

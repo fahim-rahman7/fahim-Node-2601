@@ -1,22 +1,76 @@
-// Get Logged-in User Profile
+import { User } from '../models/user.model.js';
+import cloudinary, { deleteFromCloudinary } from '../config/cloudinary.js';
+
+// Get Profile
 export const getUserProfile = async (req, res) => {
-    try {
-      // req.user contains the authenticated user details from protect middleware
-      const user = req.user;
-  
-      res.status(200).json({
-        success: true,
-        message: 'Profile retrieved successfully!',
-        data: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          createdAt: user.createdAt,
-          updatedAt: user.updatedAt,
-        },
-      });
-    } catch (error) {
-      console.error('Get Profile Error:', error.message);
-      res.status(500).json({ success: false, message: 'Internal Server Error' });
+  try {
+    const user = req.user;
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile retrieved successfully!',
+      data: user,
+    });
+  } catch (error) {
+    console.error('Get Profile Error:', error.message);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
+  }
+};
+
+// Update Profile
+export const updateUserProfile = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const { name, address, bio, phone } = req.body;
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found!' });
     }
-  };
+
+    // Update text fields if provided
+    if (name) user.name = name;
+    if (address !== undefined) user.address = address;
+    if (bio !== undefined) user.bio = bio;
+    if (phone !== undefined) user.phone = phone;
+
+    // Handle Image Upload if file exists
+    if (req.file) {
+      // 1. Delete previous image from Cloudinary if exists
+      if (user.profilePicture && user.profilePicture.publicId) {
+        await deleteFromCloudinary(user.profilePicture.publicId);
+      }
+
+      // 2. Upload new image using Stream
+      const uploadPromise = new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { folder: 'user_profiles' },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        );
+        stream.end(req.file.buffer);
+      });
+
+      const cloudinaryResult = await uploadPromise;
+
+      // 3. Update profilePicture field in user document
+      user.profilePicture = {
+        url: cloudinaryResult.secure_url,
+        publicId: cloudinaryResult.public_id,
+      };
+    }
+
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully!',
+      data: user,
+    });
+  } catch (error) {
+    console.error('Update Profile Error:', error.message);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
+  }
+};
