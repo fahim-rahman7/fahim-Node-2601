@@ -2,8 +2,81 @@ import argon2 from 'argon2';
 import jwt from 'jsonwebtoken';
 import { User } from '../models/user.model.js';
 import { redisClient } from '../config/redis.js';
-import { sendEmail, generateOtpEmailTemplate, generateResetPasswordEmailTemplate } from '../utils/sendEmail.js';
+import { sendEmail, generateOtpEmailTemplate, generateResetLinkEmailTemplate } from '../utils/sendEmail.js';
 import { generateAccessToken, generateRefreshToken, generate6DigitOTP } from '../utils/token.utils.js';
+import { OAuth2Client } from 'google-auth-library';
+import { randomBytes } from 'crypto'; // Direct function import
+
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// 8. Google Login / Register
+export const googleLogin = async (req, res) => {
+  try {
+    const { idToken } = req.body;
+
+    if (!idToken) {
+      return res.status(400).json({ success: false, message: 'Google ID token is required!' });
+    }
+
+    // Verify Google ID Token
+    const ticket = await client.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const { email, name } = payload;
+
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Google authentication failed: Email not found!' });
+    }
+
+    // Check if user already exists in MongoDB
+    let user = await User.findOne({ email });
+
+    // If user does not exist, automatically register them
+    if (!user) {
+      // Generate a random secure password since password field is required in schema
+      const randomPassword = Math.random().toString(36).slice(-8) + Math.random().toString(36).slice(-8);
+      const hashedPassword = await argon2.hash(randomPassword);
+
+      user = await User.create({
+        name,
+        email,
+        password: hashedPassword,
+      });
+    }
+
+    // Generate Access & Refresh Tokens
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
+
+    // Store Refresh Token in Redis with 7 days expiration
+    await redisClient.set(`refresh_token:${user._id}`, refreshToken, 'EX', 604800);
+
+    // Send Refresh Token in HttpOnly Cookie
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Google login successful!',
+      accessToken,
+      data: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (error) {
+    console.error('Google Auth Error:', error.message);
+    res.status(401).json({ success: false, message: 'Invalid Google token or authentication failed!' });
+  }
+};
 
 // 1. Register User & Send OTP via Redis & Brevo
 export const registerUser = async (req, res) => {
@@ -220,7 +293,7 @@ export const logoutUser = async (req, res) => {
   }
 };
 
-// 6. Forgot Password - Send OTP via Redis
+// 6. Forgot Password - Send Reset Link via Email
 export const forgotPassword = async (req, res) => {
   try {
     const { email } = req.body;
@@ -234,19 +307,26 @@ export const forgotPassword = async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found with this email!' });
     }
 
-    const otp = generate6DigitOTP();
-    await redisClient.set(`forgot_otp:${email}`, otp, 'EX', 300);
+    // Generate secure random reset token
+    const resetToken = randomBytes(32).toString('hex');
 
-    const htmlContent = generateResetPasswordEmailTemplate(user.name, otp);
+    // Store token in Redis with 15 minutes expiration (900 seconds), mapping token to user._id
+    await redisClient.set(`reset_token:${resetToken}`, user._id.toString(), 'EX', 900);
+
+    // Construct frontend reset link (Frontend URL should be in .env)
+    const frontendUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+    const resetLink = `${frontendUrl}/reset-password?token=${resetToken}`;
+
+    const htmlContent = generateResetLinkEmailTemplate(user.name, resetLink);
     await sendEmail({
       to: email,
-      subject: 'Password Reset OTP',
+      subject: 'Password Reset Link',
       htmlContent,
     });
 
     res.status(200).json({
       success: true,
-      message: 'Password reset OTP sent to your email. Please check your inbox.',
+      message: 'Password reset link sent to your email. Please check your inbox.',
     });
   } catch (error) {
     console.error('Forgot Password Error:', error.message);
@@ -254,33 +334,42 @@ export const forgotPassword = async (req, res) => {
   }
 };
 
-// 7. Reset Password - Verify OTP from Redis & Update Password
 export const resetPassword = async (req, res) => {
   try {
-    const { email, otp, newPassword } = req.body;
+    const { token } = req.params; // <- Get token from URL params
+    const { newPassword, confirmPassword } = req.body; // <- Get passwords from body
 
-    if (!email || !otp || !newPassword) {
-      return res.status(400).json({ success: false, message: 'All fields are required!' });
+    if (!token || !newPassword || !confirmPassword) {
+      return res.status(400).json({ success: false, message: 'Token, new password and confirm password are required!' });
     }
 
-    const storedOtp = await redisClient.get(`forgot_otp:${email}`);
-    if (!storedOtp) {
-      return res.status(400).json({ success: false, message: 'OTP expired or invalid! Please request again.' });
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ success: false, message: 'New password and confirm password do not match!' });
     }
 
-    if (storedOtp !== otp) {
-      return res.status(400).json({ success: false, message: 'Invalid OTP! Please provide the correct OTP.' });
+    // Get user ID from Redis using the reset token
+    const userId = await redisClient.get(`reset_token:${token}`);
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired password reset token!' });
     }
 
+    const user = await User.findById(userId).select('+password');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User no longer exists!' });
+    }
+
+    // Hash new password using Argon2
     const hashedPassword = await argon2.hash(newPassword);
-    const user = await User.findOneAndUpdate({ email }, { password: hashedPassword });
+    
+    // Update password in MongoDB
+    user.password = hashedPassword;
+    await user.save();
 
-    if (user) {
-      // Invalidate refresh token from Redis upon password reset
-      await redisClient.del(`refresh_token:${user._id}`);
-    }
+    // Delete the reset token from Redis (Single-use security)
+    await redisClient.del(`reset_token:${token}`);
 
-    await redisClient.del(`forgot_otp:${email}`);
+    // Invalidate user's refresh token in Redis to force re-login from all devices
+    await redisClient.del(`refresh_token:${userId}`);
 
     res.status(200).json({
       success: true,
