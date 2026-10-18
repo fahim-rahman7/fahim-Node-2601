@@ -20,7 +20,7 @@ export const initSocket = (io) => {
         return next(new Error('Authentication error: Token required'));
       }
 
-      const decoded = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
+      const decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET);
       socket.user = decoded;
       next();
     } catch (err) {
@@ -31,54 +31,60 @@ export const initSocket = (io) => {
 
   io.on('connection', (socket) => {
     const userId = socket.user.id || socket.user._id;
-    
+    const roomId = userId.toString();
+
     // Store user in online map & join their own personal room
-    onlineUsers.set(userId.toString(), socket.id);
-    socket.join(userId.toString());
+    onlineUsers.set(roomId, socket.id);
+    socket.join(roomId);
 
-    console.log(`User connected to Socket: ${userId} (Socket ID: ${socket.id})`);
-
+    console.log('[SOCKET] User connected:', roomId);
+    console.log('[SOCKET] Personal room:', roomId);
+    console.log('[SOCKET] Socket rooms:', [...socket.rooms]);
     // ==========================================
     // 1. PRIVATE CHAT EVENTS
     // ==========================================
     socket.on('send_message', async (data) => {
-      try {
-        const { recipientId, message } = data;
-
-        if (!recipientId || !message || !message.trim()) {
-          return socket.emit('error_message', { message: 'Recipient and message content are required!' });
+        try {
+          const { recipientId, message } = data;
+          console.log(`[SOCKET] User ${userId} sending message to ${recipientId}: "${message}"`);
+  
+          if (!recipientId || !message || !message.trim()) {
+            return socket.emit('error_message', { message: 'Recipient and message content are required!' });
+          }
+  
+          // Check Friendship Validation
+          const sender = await User.findById(userId);
+          const isFriend = sender.friends.some((id) => id.toString() === recipientId.toString());
+  
+          if (!isFriend) {
+            console.log(`[SOCKET ERROR] Friendship check failed between ${userId} and ${recipientId}`);
+            return socket.emit('error_message', { message: 'You can only message users in your friend list!' });
+          }
+  
+          // Save Message to Database
+          const newMessage = await Message.create({
+            sender: userId,
+            recipient: recipientId,
+            message: message.trim(),
+          });
+  
+          // Populate sender & recipient info for frontend rendering
+          const populatedMsg = await Message.findById(newMessage._id)
+            .populate('sender', 'name email profilePicture')
+            .populate('recipient', 'name email profilePicture');
+  
+          console.log(`[SOCKET] Message saved to DB. Emitting to room: ${recipientId.toString()}`);
+  
+          // Emit message to recipient if online (to their personal room)
+          io.to(recipientId.toString()).emit('receive_message', populatedMsg);
+  
+          // Acknowledge the sender with sent message
+          socket.emit('message_sent', populatedMsg);
+        } catch (error) {
+          console.error('Socket send_message error:', error.message);
+          socket.emit('error_message', { message: 'Failed to send message.' });
         }
-
-        // Check Friendship Validation
-        const sender = await User.findById(userId);
-        const isFriend = sender.friends.some((id) => id.toString() === recipientId.toString());
-
-        if (!isFriend) {
-          return socket.emit('error_message', { message: 'You can only message users in your friend list!' });
-        }
-
-        // Save Message to Database
-        const newMessage = await Message.create({
-          sender: userId,
-          recipient: recipientId,
-          message: message.trim(),
-        });
-
-        // Populate sender & recipient info for frontend rendering
-        const populatedMsg = await Message.findById(newMessage._id)
-          .populate('sender', 'name email profilePicture')
-          .populate('recipient', 'name email profilePicture');
-
-        // Emit message to recipient if online (to their personal room)
-        io.to(recipientId.toString()).emit('receive_message', populatedMsg);
-
-        // Acknowledge the sender with sent message
-        socket.emit('message_sent', populatedMsg);
-      } catch (error) {
-        console.error('Socket send_message error:', error.message);
-        socket.emit('error_message', { message: 'Failed to send message.' });
-      }
-    });
+      });
 
     // ==========================================
     // 2. GROUP CHAT EVENTS

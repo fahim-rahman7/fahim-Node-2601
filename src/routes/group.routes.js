@@ -6,7 +6,8 @@ import {
   paymentCancel, 
   getUserGroups, 
   getGroupMessages,
-  addMemberToGroup 
+  addMemberToGroup,
+  deleteGroup, 
 } from '../controllers/group.controller.js';
 import { protect } from '../middlewares/authMiddleware.js';
 
@@ -23,4 +24,5 @@ router.get('/:groupId/messages', protect, getGroupMessages);
 // Free route for adding new members by Admin
 router.post('/:groupId/add-member', protect, addMemberToGroup);
 
+router.delete('/:groupId', protect, deleteGroup);
 export default router;
