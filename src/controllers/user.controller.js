@@ -74,3 +74,48 @@ export const updateUserProfile = async (req, res) => {
     res.status(500).json({ success: false, message: 'Internal Server Error' });
   }
 };
+
+// Get Friend Profile by ID (Only if they are friends or self)
+export const getUserProfileById = async (req, res) => {
+    try {
+      const currentUserId = req.user._id;
+      const { userId } = req.params;
+  
+      // 1. If user is checking their own profile
+      if (currentUserId.toString() === userId) {
+        return res.status(200).json({
+          success: true,
+          message: 'Profile retrieved successfully!',
+          data: req.user,
+        });
+      }
+  
+      // 2. Check if the target user is in the current user's friend list
+      const currentUser = await User.findById(currentUserId);
+      const isFriend = currentUser.friends.some(
+        (friendId) => friendId.toString() === userId
+      );
+  
+      if (!isFriend) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied! You can only view profiles of your friends.',
+        });
+      }
+  
+      // 3. Fetch target user's profile (excluding password)
+      const targetUser = await User.findById(userId).select('-password');
+      if (!targetUser) {
+        return res.status(404).json({ success: false, message: 'User not found!' });
+      }
+  
+      res.status(200).json({
+        success: true,
+        message: 'Friend profile retrieved successfully!',
+        data: targetUser,
+      });
+    } catch (error) {
+      console.error('Get User Profile By ID Error:', error.message);
+      res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+  };
