@@ -2,12 +2,17 @@ import SSLCommerzPayment from 'sslcommerz-lts';
 import { Group } from '../models/group.model.js';
 import { GroupMessage } from '../models/groupMessage.model.js';
 import { User } from '../models/user.model.js';
-import {redisClient} from '../config/redis.js'; // আপানার প্রজেক্টের redis client import করুন
+import { redisClient } from '../config/redis.js';
 import crypto from 'crypto';
 
 const store_id = process.env.STORE_ID;
 const store_passwd = process.env.STORE_PASSWORD;
 const is_live = process.env.IS_LIVE === 'true'; // Sandbox er jonno false thakbe
+
+// Helper URLs for Local & Production (Render + Vercel)
+// BACKEND_URL না থাকলে req থেকে অটো লাইভ হোস্ট ধরে নেবে
+const getBackendUrl = (req) => process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+const getFrontendUrl = () => process.env.CLIENT_URL || process.env.FRONTEND_URL || 'http://localhost:5173';
 
 // 1. Initiate Group Creation Payment
 export const initGroupPayment = async (req, res) => {
@@ -40,14 +45,16 @@ export const initGroupPayment = async (req, res) => {
     };
     await redisClient.set(`pending_group:${tran_id}`, JSON.stringify(groupData), 'EX', 1800);
 
+    const BACKEND_URL = getBackendUrl(req);
+
     const data = {
       total_amount: amount,
       currency: 'BDT',
       tran_id: tran_id,
-      success_url: `http://localhost:8000/api/v1/groups/payment/success/${tran_id}`,
-      fail_url: `http://localhost:8000/api/v1/groups/payment/fail/${tran_id}`,
-      cancel_url: `http://localhost:8000/api/v1/groups/payment/cancel`,
-      ipn_url: `http://localhost:8000/api/v1/groups/payment/ipn`,
+      success_url: `${BACKEND_URL}/api/v1/groups/payment/success/${tran_id}`,
+      fail_url: `${BACKEND_URL}/api/v1/groups/payment/fail/${tran_id}`,
+      cancel_url: `${BACKEND_URL}/api/v1/groups/payment/cancel`,
+      ipn_url: `${BACKEND_URL}/api/v1/groups/payment/ipn`,
       shipping_method: 'N/A',
       product_name: 'Group Chat Creation',
       product_category: 'Service',
@@ -83,12 +90,13 @@ export const initGroupPayment = async (req, res) => {
 
 // 2. Payment Success Handler
 export const paymentSuccess = async (req, res) => {
+  const FRONTEND_URL = getFrontendUrl();
   try {
     const { tran_id } = req.params;
 
     const cachedData = await redisClient.get(`pending_group:${tran_id}`);
     if (!cachedData) {
-      return res.redirect('http://localhost:5173/chat?payment=expired');
+      return res.redirect(`${FRONTEND_URL}/chat?payment=expired`);
     }
 
     const { admin, groupName, members } = JSON.parse(cachedData);
@@ -103,24 +111,26 @@ export const paymentSuccess = async (req, res) => {
     // Clear redis cache
     await redisClient.del(`pending_group:${tran_id}`);
 
-    // Frontend-এ success কুয়েরি দিয়ে রিডাইরেক্ট করা
-    res.redirect('http://localhost:5173/chat?payment=success');
+    // Frontend-এ success কুয়েরি দিয়ে রিডাইরেক্ট করা
+    res.redirect(`${FRONTEND_URL}/chat?payment=success`);
   } catch (error) {
     console.error('Payment Success Error:', error.message);
-    res.redirect('http://localhost:5173/chat?payment=error');
+    res.redirect(`${FRONTEND_URL}/chat?payment=error`);
   }
 };
 
 // 3. Payment Fail Handler
 export const paymentFail = async (req, res) => {
+  const FRONTEND_URL = getFrontendUrl();
   const { tran_id } = req.params;
   await redisClient.del(`pending_group:${tran_id}`);
-  res.redirect('http://localhost:5173/chat?payment=failed');
+  res.redirect(`${FRONTEND_URL}/chat?payment=failed`);
 };
 
 // 4. Payment Cancel Handler
 export const paymentCancel = async (req, res) => {
-  res.redirect('http://localhost:5173/chat?payment=cancelled');
+  const FRONTEND_URL = getFrontendUrl();
+  res.redirect(`${FRONTEND_URL}/chat?payment=cancelled`);
 };
 
 // 5. Get User's Groups List
@@ -157,77 +167,77 @@ export const getGroupMessages = async (req, res) => {
   }
 };
 
-// Add Multiple Members to Existing Group (Free - Admin Only)
+// 7. Add Multiple Members to Existing Group (Admin Only)
 export const addMemberToGroup = async (req, res) => {
-    try {
-      const currentUserId = req.user._id;
-      const { groupId } = req.params;
-      const { members } = req.body; // Array of friend IDs: ["id1", "id2", ...]
-  
-      if (!members || !Array.isArray(members) || members.length === 0) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Please provide an array of member IDs to add!' 
-        });
-      }
-  
-      const group = await Group.findById(groupId);
-      if (!group) {
-        return res.status(404).json({ success: false, message: 'Group not found!' });
-      }
-  
-      // 1. Check if requester is Admin
-      if (group.admin.toString() !== currentUserId.toString()) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'Only the group admin can add new members!' 
-        });
-      }
-  
-      // 2. Ensure all member IDs belong to the admin's friend list
-      const adminUser = await User.findById(currentUserId);
-      const nonFriends = members.filter(
-        (mId) => !adminUser.friends.some((fId) => fId.toString() === mId.toString())
-      );
-  
-      if (nonFriends.length > 0) {
-        return res.status(400).json({
-          success: false,
-          message: 'You can only add users who are in your friend list!',
-        });
-      }
-  
-      // 3. Filter out users who are already group members
-      const newMembers = members.filter(
-        (mId) => !group.members.some((existingId) => existingId.toString() === mId.toString())
-      );
-  
-      if (newMembers.length === 0) {
-        return res.status(400).json({
-          success: false,
-          message: 'All selected users are already members of this group!',
-        });
-      }
-  
-      // 4. Add new unique members to the group ($addToSet prevents duplicates)
-      await Group.findByIdAndUpdate(groupId, {
-        $addToSet: { members: {$each: newMembers } },
-      });
-  
-      const updatedGroup = await Group.findById(groupId).populate('members', 'name email profilePicture');
-  
-      res.status(200).json({
-        success: true,
-        message: `${newMembers.length} member(s) added to group successfully!`,
-        data: updatedGroup,
-      });
-    } catch (error) {
-      console.error('Add Group Members Error:', error.message);
-      res.status(500).json({ success: false, message: 'Internal Server Error' });
-    }
-  };
+  try {
+    const currentUserId = req.user._id;
+    const { groupId } = req.params;
+    const { members } = req.body; // Array of friend IDs: ["id1", "id2", ...]
 
-  // Delete Group (Admin Only)
+    if (!members || !Array.isArray(members) || members.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Please provide an array of member IDs to add!' 
+      });
+    }
+
+    const group = await Group.findById(groupId);
+    if (!group) {
+      return res.status(404).json({ success: false, message: 'Group not found!' });
+    }
+
+    // 1. Check if requester is Admin
+    if (group.admin.toString() !== currentUserId.toString()) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Only the group admin can add new members!' 
+      });
+    }
+
+    // 2. Ensure all member IDs belong to the admin's friend list
+    const adminUser = await User.findById(currentUserId);
+    const nonFriends = members.filter(
+      (mId) => !adminUser.friends.some((fId) => fId.toString() === mId.toString())
+    );
+
+    if (nonFriends.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'You can only add users who are in your friend list!',
+      });
+    }
+
+    // 3. Filter out users who are already group members
+    const newMembers = members.filter(
+      (mId) => !group.members.some((existingId) => existingId.toString() === mId.toString())
+    );
+
+    if (newMembers.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'All selected users are already members of this group!',
+      });
+    }
+
+    // 4. Add new unique members to the group ($addToSet prevents duplicates)
+    await Group.findByIdAndUpdate(groupId, {
+      $addToSet: { members: {$each: newMembers } },
+    });
+
+    const updatedGroup = await Group.findById(groupId).populate('members', 'name email profilePicture');
+
+    res.status(200).json({
+      success: true,
+      message: `${newMembers.length} member(s) added to group successfully!`,
+      data: updatedGroup,
+    });
+  } catch (error) {
+    console.error('Add Group Members Error:', error.message);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
+  }
+};
+
+// 8. Delete Group (Admin Only)
 export const deleteGroup = async (req, res) => {
   try {
     const currentUserId = req.user._id;
