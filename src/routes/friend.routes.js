@@ -7,7 +7,8 @@ import {
   getIncomingRequests, 
   getSentRequests, 
   getFriendList, 
-  getFriendSuggestions 
+  getFriendSuggestions,
+  getOnlineFriends // 👈 Import koren
 } from '../controllers/friend.controller.js';
 import { protect } from '../middlewares/authMiddleware.js';
 
@@ -22,5 +23,6 @@ router.get('/requests', protect, getIncomingRequests);             // Incoming r
 router.get('/sent-requests', protect, getSentRequests);            // Sent requests dekhar jonno
 router.get('/list', protect, getFriendList);                       // Friend list dekhar jonno
 router.get('/suggestions', protect, getFriendSuggestions);         // Suggestion list dekhar jonno
+router.get('/online', protect, getOnlineFriends);                  // 👈 Online active friends list pawar route
 
 export default router;

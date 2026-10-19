@@ -295,3 +295,25 @@ export const getFriendSuggestions = async (req, res) => {
     res.status(500).json({ success: false, message: 'Internal Server Error' });
   }
 };
+
+// Get Online Friends (Optional, jodi HTTP call laghe)
+export const getOnlineFriends = async (req, res) => {
+  try {
+    const currentUser = await User.findById(req.user._id).populate('friends', 'name email profilePicture bio address');
+    
+    // Note: onlineUsers map-ti socket file theke export korte hobe ba app.locals e rakhte hobe
+    const onlineUsersMap = req.app.get('onlineUsers') || new Map();
+
+    const onlineFriends = currentUser.friends.filter(friend => 
+      onlineUsersMap.has(friend._id.toString())
+    );
+
+    res.status(200).json({
+      success: true,
+      data: onlineFriends,
+    });
+  } catch (error) {
+    console.error('Get Online Friends Error:', error.message);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
+  }
+};

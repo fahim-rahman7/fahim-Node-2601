@@ -1,147 +1,438 @@
 import jwt from 'jsonwebtoken';
+
 import { User } from '../models/user.model.js';
 import { Message } from '../models/message.model.js';
 import { Group } from '../models/group.model.js';
 import { GroupMessage } from '../models/groupMessage.model.js';
 
-// Online users keep track: userId -> socketId
-const onlineUsers = new Map();
+// Store online users:
+// userId -> Set of socket IDs
+//
+// Example:
+// Map {
+//   "userId1" => Set(["socketId1", "socketId2"]),
+//   "userId2" => Set(["socketId3"])
+// }
+//
+// Set ব্যবহার করার ফলে একই user একাধিক tab/device থেকে
+// connected থাকলেও তার online status ঠিক থাকবে।
+
+export const onlineUsers = new Map();
+
+
+// ==========================================
+// HELPER: Notify Friends About Online Status
+// ==========================================
+
+const notifyFriendsAboutPresence = async (io, userId, isOnline) => {
+  try {
+    const normalizedUserId = String(userId);
+
+    const user = await User.findById(normalizedUserId).select('friends');
+
+    if (!user) {
+      return;
+    }
+
+    // Status query চলাকালীন user আবার online/offline হয়ে গেলে
+    // stale event পাঠানো হবে না।
+    const currentlyOnline = onlineUsers.has(normalizedUserId);
+
+    if (currentlyOnline !== isOnline) {
+      return;
+    }
+
+    const payload = {
+      userId: normalizedUserId,
+      isOnline,
+    };
+
+    // Only send presence updates to this user's friends.
+    // সব connected user-এর কাছে presence broadcast করা হচ্ছে না।
+    for (const friendId of user.friends || []) {
+      io.to(String(friendId)).emit('friend_online_status', payload);
+    }
+
+    console.log(
+      `[PRESENCE] User ${normalizedUserId} is ${
+        isOnline ? 'online' : 'offline'
+      }. Friends notified.`
+    );
+  } catch (error) {
+    console.error(
+      '[PRESENCE] Failed to notify friends:',
+      error.message
+    );
+  }
+};
+
+
+// ==========================================
+// INITIALIZE SOCKET.IO
+// ==========================================
 
 export const initSocket = (io) => {
-  // Socket Authentication Middleware
+  // ==========================================
+  // 1. SOCKET AUTHENTICATION
+  // ==========================================
+
   io.use(async (socket, next) => {
     try {
-      const token = 
-        socket.handshake.auth?.token || 
-        socket.handshake.headers?.authorization?.split(' ')[1] || 
+      const authorization = socket.handshake.headers?.authorization;
+
+      const token =
+        socket.handshake.auth?.token ||
+        (authorization?.startsWith('Bearer ')
+          ? authorization.split(' ')[1]
+          : null) ||
         socket.handshake.query?.token;
 
       if (!token) {
-        return next(new Error('Authentication error: Token required'));
+        return next(
+          new Error('Authentication error: Token required')
+        );
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET);
+      const decoded = jwt.verify(
+        token,
+        process.env.JWT_ACCESS_SECRET
+      );
+
       socket.user = decoded;
+
       next();
-    } catch (err) {
-      console.log('Socket JWT Error:', err.message);
-      next(new Error('Authentication error: Invalid token'));
+    } catch (error) {
+      console.error('[SOCKET] JWT Error:', error.message);
+
+      next(
+        new Error('Authentication error: Invalid token')
+      );
     }
   });
 
+
+  // ==========================================
+  // 2. CONNECTION EVENT
+  // ==========================================
+
   io.on('connection', (socket) => {
-    const userId = socket.user.id || socket.user._id;
-    const roomId = userId.toString();
+    const rawUserId =
+      socket.user?.id ||
+      socket.user?._id ||
+      socket.user?.userId;
 
-    // Store user in online map & join their own personal room
-    onlineUsers.set(roomId, socket.id);
-    socket.join(roomId);
+    if (!rawUserId) {
+      console.error(
+        '[SOCKET] Connected user has no valid ID.'
+      );
 
-    console.log('[SOCKET] User connected:', roomId);
-    console.log('[SOCKET] Personal room:', roomId);
-    console.log('[SOCKET] Socket rooms:', [...socket.rooms]);
-    // ==========================================
-    // 1. PRIVATE CHAT EVENTS
-    // ==========================================
-    socket.on('send_message', async (data) => {
-        try {
-          const { recipientId, message } = data;
-          console.log(`[SOCKET] User ${userId} sending message to ${recipientId}: "${message}"`);
-  
-          if (!recipientId || !message || !message.trim()) {
-            return socket.emit('error_message', { message: 'Recipient and message content are required!' });
-          }
-  
-          // Check Friendship Validation
-          const sender = await User.findById(userId);
-          const isFriend = sender.friends.some((id) => id.toString() === recipientId.toString());
-  
-          if (!isFriend) {
-            console.log(`[SOCKET ERROR] Friendship check failed between ${userId} and ${recipientId}`);
-            return socket.emit('error_message', { message: 'You can only message users in your friend list!' });
-          }
-  
-          // Save Message to Database
-          const newMessage = await Message.create({
-            sender: userId,
-            recipient: recipientId,
-            message: message.trim(),
-          });
-  
-          // Populate sender & recipient info for frontend rendering
-          const populatedMsg = await Message.findById(newMessage._id)
-            .populate('sender', 'name email profilePicture')
-            .populate('recipient', 'name email profilePicture');
-  
-          console.log(`[SOCKET] Message saved to DB. Emitting to room: ${recipientId.toString()}`);
-  
-          // Emit message to recipient if online (to their personal room)
-          io.to(recipientId.toString()).emit('receive_message', populatedMsg);
-  
-          // Acknowledge the sender with sent message
-          socket.emit('message_sent', populatedMsg);
-        } catch (error) {
-          console.error('Socket send_message error:', error.message);
-          socket.emit('error_message', { message: 'Failed to send message.' });
+      socket.disconnect(true);
+      return;
+    }
+
+    const userId = String(rawUserId);
+
+    // Check if this user already has another active connection.
+    let userSockets = onlineUsers.get(userId);
+
+    const wasOffline = !userSockets || userSockets.size === 0;
+
+    if (!userSockets) {
+      userSockets = new Set();
+      onlineUsers.set(userId, userSockets);
+    }
+
+    // Save this connection's socket ID.
+    userSockets.add(socket.id);
+
+    // Every user's personal room is their user ID.
+    // Private messages and friend presence updates use this room.
+    socket.join(userId);
+
+    console.log('[SOCKET] User connected:', userId);
+    console.log('[SOCKET] Socket ID:', socket.id);
+    console.log(
+      '[SOCKET] Active connections for user:',
+      userSockets.size
+    );
+
+    // Notify friends only when the user transitions
+    // from offline to online.
+    if (wasOffline) {
+      void notifyFriendsAboutPresence(io, userId, true);
+    }
+
+    // Send the connecting user their currently online friends.
+    // Frontend uses this event to initialize Active Now status.
+    const sendOnlineFriends = async () => {
+      try {
+        const currentUser = await User.findById(userId)
+          .select('friends');
+
+        if (!currentUser) {
+          socket.emit('online_friends', []);
+          return;
         }
-      });
+
+        const friendIds = (currentUser?.friends || []).map(
+          (friendId) => String(friendId)
+        );
+        
+        const allOnlineIds = [...onlineUsers.keys()];
+        
+        const onlineFriendIds = friendIds.filter(
+          (friendId) => onlineUsers.has(friendId)
+        );
+        
+        console.log('[PRESENCE DEBUG] Current user:', userId);
+        console.log('[PRESENCE DEBUG] Friend IDs:', friendIds);
+        console.log('[PRESENCE DEBUG] Online user IDs:', allOnlineIds);
+        console.log('[PRESENCE DEBUG] Online friend IDs:', onlineFriendIds);
+        
+        socket.emit('online_friends', onlineFriendIds);
+      } catch (error) {
+        console.error(
+          '[PRESENCE] Failed to get online friends:',
+          error.message
+        );
+
+        socket.emit('online_friends', []);
+      }
+    };
+
+    void sendOnlineFriends();
+
 
     // ==========================================
-    // 2. GROUP CHAT EVENTS
+    // 3. PRIVATE CHAT EVENTS
+    // ==========================================
+
+    // Send Private Message
+    socket.on('send_message', async (data) => {
+      try {
+        const { recipientId, message } = data || {};
+
+        console.log(
+          `[SOCKET] User ${userId} sending message to ${recipientId}`
+        );
+
+        if (
+          !recipientId ||
+          typeof message !== 'string' ||
+          !message.trim()
+        ) {
+          return socket.emit('error_message', {
+            message:
+              'Recipient and message content are required!',
+          });
+        }
+
+        // Check whether sender and recipient are friends.
+        const sender = await User.findById(userId)
+          .select('friends');
+
+        if (!sender) {
+          return socket.emit('error_message', {
+            message: 'Sender account not found.',
+          });
+        }
+
+        const isFriend = (sender.friends || []).some(
+          (friendId) =>
+            String(friendId) === String(recipientId)
+        );
+
+        if (!isFriend) {
+          console.log(
+            `[SOCKET] Friendship check failed between ${userId} and ${recipientId}`
+          );
+
+          return socket.emit('error_message', {
+            message:
+              'You can only message users in your friend list!',
+          });
+        }
+
+        // Save message to database.
+        const newMessage = await Message.create({
+          sender: userId,
+          recipient: recipientId,
+          message: message.trim(),
+        });
+
+        // Populate sender and recipient details.
+        const populatedMsg = await Message.findById(
+          newMessage._id
+        )
+          .populate('sender', 'name email profilePicture')
+          .populate('recipient', 'name email profilePicture');
+
+        console.log(
+          `[SOCKET] Message saved. Recipient room: ${String(recipientId)}`
+        );
+
+        // All active sockets belonging to the recipient
+        // will receive the message through their personal room.
+        io.to(String(recipientId)).emit(
+          'receive_message',
+          populatedMsg
+        );
+
+        // Acknowledge the sender.
+        socket.emit('message_sent', populatedMsg);
+      } catch (error) {
+        console.error(
+          '[SOCKET] send_message error:',
+          error.message
+        );
+
+        socket.emit('error_message', {
+          message: 'Failed to send message.',
+        });
+      }
+    });
+
+
+    // ==========================================
+    // 4. GROUP CHAT EVENTS
     // ==========================================
 
     // Join Group Room
     socket.on('join_group', async (groupId) => {
       try {
-        const group = await Group.findById(groupId);
-        if (group && group.members.some((id) => id.toString() === userId.toString())) {
-          socket.join(groupId);
-          console.log(`User ${userId} joined group room: ${groupId}`);
+        if (!groupId) {
+          return;
         }
-      } catch (err) {
-        console.error('Join group error:', err.message);
+
+        const group = await Group.findById(groupId);
+
+        if (!group) {
+          return;
+        }
+
+        const isMember = (group.members || []).some(
+          (memberId) => String(memberId) === userId
+        );
+
+        if (!isMember) {
+          console.log(
+            `[SOCKET] User ${userId} is not a member of group ${groupId}`
+          );
+
+          return;
+        }
+
+        const groupRoomId = String(groupId);
+
+        socket.join(groupRoomId);
+
+        console.log(
+          `[SOCKET] User ${userId} joined group room: ${groupRoomId}`
+        );
+      } catch (error) {
+        console.error(
+          '[SOCKET] Join group error:',
+          error.message
+        );
       }
     });
+
 
     // Send Group Message
     socket.on('send_group_message', async (data) => {
       try {
-        const { groupId, message } = data;
+        const { groupId, message } = data || {};
 
-        if (!groupId || !message || !message.trim()) {
-          return socket.emit('error_message', { message: 'Group ID and message content are required!' });
+        if (
+          !groupId ||
+          typeof message !== 'string' ||
+          !message.trim()
+        ) {
+          return socket.emit('error_message', {
+            message:
+              'Group ID and message content are required!',
+          });
         }
 
-        // Check if user is a member of the group
+        // Verify group membership.
         const group = await Group.findById(groupId);
-        if (!group || !group.members.some((id) => id.toString() === userId.toString())) {
-          return socket.emit('error_message', { message: 'You are not a member of this group!' });
+
+        if (!group) {
+          return socket.emit('error_message', {
+            message: 'Group not found.',
+          });
         }
 
-        // Save Group Message to DB
+        const isMember = (group.members || []).some(
+          (memberId) => String(memberId) === userId
+        );
+
+        if (!isMember) {
+          return socket.emit('error_message', {
+            message: 'You are not a member of this group!',
+          });
+        }
+
+        // Save group message.
         const newGroupMsg = await GroupMessage.create({
           group: groupId,
           sender: userId,
           message: message.trim(),
         });
 
-        const populatedMsg = await GroupMessage.findById(newGroupMsg._id)
-          .populate('sender', 'name email profilePicture');
+        // Populate sender details.
+        const populatedMsg = await GroupMessage.findById(
+          newGroupMsg._id
+        ).populate(
+          'sender',
+          'name email profilePicture'
+        );
 
-        // Broadcast message to all members in the group room (including sender)
-        io.to(groupId).emit('receive_group_message', populatedMsg);
+        // Broadcast to sockets that have joined this group room.
+        io.to(String(groupId)).emit(
+          'receive_group_message',
+          populatedMsg
+        );
       } catch (error) {
-        console.error('Group message error:', error.message);
-        socket.emit('error_message', { message: 'Failed to send group message.' });
+        console.error(
+          '[SOCKET] Group message error:',
+          error.message
+        );
+
+        socket.emit('error_message', {
+          message: 'Failed to send message.',
+        });
       }
     });
 
+
     // ==========================================
-    // 3. DISCONNECT EVENT
+    // 5. DISCONNECT EVENT
     // ==========================================
-    socket.on('disconnect', () => {
-      onlineUsers.delete(userId.toString());
-      console.log(`User disconnected: ${userId}`);
+
+    socket.on('disconnect', (reason) => {
+      const currentSockets = onlineUsers.get(userId);
+
+      if (!currentSockets) {
+        return;
+      }
+
+      // Remove only this socket connection.
+      currentSockets.delete(socket.id);
+
+      console.log('[SOCKET] User disconnected:', userId);
+      console.log('[SOCKET] Disconnect reason:', reason);
+      console.log(
+        '[SOCKET] Remaining connections:',
+        currentSockets.size
+      );
+
+      // A user is offline only after their final socket disconnects.
+      if (currentSockets.size === 0) {
+        onlineUsers.delete(userId);
+
+        void notifyFriendsAboutPresence(io, userId, false);
+      }
     });
   });
 };
