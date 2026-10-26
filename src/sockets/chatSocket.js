@@ -1,28 +1,10 @@
 import jwt from 'jsonwebtoken';
-
 import { User } from '../models/user.model.js';
 import { Message } from '../models/message.model.js';
 import { Group } from '../models/group.model.js';
 import { GroupMessage } from '../models/groupMessage.model.js';
 
-// Store online users:
-// userId -> Set of socket IDs
-//
-// Example:
-// Map {
-//   "userId1" => Set(["socketId1", "socketId2"]),
-//   "userId2" => Set(["socketId3"])
-// }
-//
-// Set ব্যবহার করার ফলে একই user একাধিক tab/device থেকে
-// connected থাকলেও তার online status ঠিক থাকবে।
-
 export const onlineUsers = new Map();
-
-
-// ==========================================
-// HELPER: Notify Friends About Online Status
-// ==========================================
 
 const notifyFriendsAboutPresence = async (io, userId, isOnline) => {
   try {
@@ -34,8 +16,6 @@ const notifyFriendsAboutPresence = async (io, userId, isOnline) => {
       return;
     }
 
-    // Status query চলাকালীন user আবার online/offline হয়ে গেলে
-    // stale event পাঠানো হবে না।
     const currentlyOnline = onlineUsers.has(normalizedUserId);
 
     if (currentlyOnline !== isOnline) {
@@ -47,8 +27,6 @@ const notifyFriendsAboutPresence = async (io, userId, isOnline) => {
       isOnline,
     };
 
-    // Only send presence updates to this user's friends.
-    // সব connected user-এর কাছে presence broadcast করা হচ্ছে না।
     for (const friendId of user.friends || []) {
       io.to(String(friendId)).emit('friend_online_status', payload);
     }
@@ -66,15 +44,7 @@ const notifyFriendsAboutPresence = async (io, userId, isOnline) => {
   }
 };
 
-
-// ==========================================
-// INITIALIZE SOCKET.IO
-// ==========================================
-
 export const initSocket = (io) => {
-  // ==========================================
-  // 1. SOCKET AUTHENTICATION
-  // ==========================================
 
   io.use(async (socket, next) => {
     try {
@@ -111,10 +81,6 @@ export const initSocket = (io) => {
   });
 
 
-  // ==========================================
-  // 2. CONNECTION EVENT
-  // ==========================================
-
   io.on('connection', (socket) => {
     const rawUserId =
       socket.user?.id ||
@@ -145,8 +111,6 @@ export const initSocket = (io) => {
     // Save this connection's socket ID.
     userSockets.add(socket.id);
 
-    // Every user's personal room is their user ID.
-    // Private messages and friend presence updates use this room.
     socket.join(userId);
 
     console.log('[SOCKET] User connected:', userId);
@@ -163,7 +127,6 @@ export const initSocket = (io) => {
     }
 
     // Send the connecting user their currently online friends.
-    // Frontend uses this event to initialize Active Now status.
     const sendOnlineFriends = async () => {
       try {
         const currentUser = await User.findById(userId)
@@ -202,10 +165,6 @@ export const initSocket = (io) => {
 
     void sendOnlineFriends();
 
-
-    // ==========================================
-    // 3. PRIVATE CHAT EVENTS
-    // ==========================================
 
     // Send Private Message
     socket.on('send_message', async (data) => {
@@ -291,11 +250,6 @@ export const initSocket = (io) => {
         });
       }
     });
-
-
-    // ==========================================
-    // 4. GROUP CHAT EVENTS
-    // ==========================================
 
     // Join Group Room
     socket.on('join_group', async (groupId) => {
@@ -404,11 +358,6 @@ export const initSocket = (io) => {
         });
       }
     });
-
-
-    // ==========================================
-    // 5. DISCONNECT EVENT
-    // ==========================================
 
     socket.on('disconnect', (reason) => {
       const currentSockets = onlineUsers.get(userId);

@@ -5,113 +5,59 @@ import { OAuth2Client } from 'google-auth-library';
 
 import { User } from '../models/user.model.js';
 import { redisClient } from '../config/redis.js';
+import { AppError } from '../utils/appError.js';
 
-import {
-  sendEmail,
-  generateOtpEmailTemplate,
-  generateResetLinkEmailTemplate,
-} from '../utils/sendEmail.js';
-
-import {
-  generateAccessToken,
-  generateRefreshToken,
-  generate6DigitOTP,
-} from '../utils/token.utils.js';
-
-import {
-  normalizeEmail,
-  validateEmail,
-  normalizeName,
-  validateName,
-  validateNewPassword,
-  validateLoginPassword,
-  getDuplicateKeyError,
-} from '../utils/authValidation.js';
+import { sendEmail, generateOtpEmailTemplate, generateResetLinkEmailTemplate } from '../utils/sendEmail.js';
+import { generateAccessToken, generateRefreshToken, generate6DigitOTP } from '../utils/token.utils.js';
+import { normalizeEmail, validateEmail, normalizeName, validateName, validateNewPassword, validateLoginPassword } from '../utils/authValidation.js';
 
 const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-
-// ==========================================
-// COMMON RESPONSE HELPER
-// ==========================================
-
-const validationError = (res, message) => {
-  return res.status(400).json({
-    success: false,
-    message,
-  });
-};
 
 // ==========================================
 // 1. GOOGLE LOGIN / REGISTER
 // ==========================================
 
-export const googleLogin = async (req, res) => {
+export const googleLogin = async (req, res, next) => {
   try {
     const { idToken } = req.body || {};
 
-    if (
-      typeof idToken !== 'string' ||
-      !idToken.trim()
-    ) {
-      return validationError(
-        res,
-        'Google ID token is required!'
-      );
+    if (typeof idToken !== 'string' || !idToken.trim()) {
+      throw new AppError('Google ID token is required!', 400);
     }
 
     if (!process.env.GOOGLE_CLIENT_ID) {
-      console.error('GOOGLE_CLIENT_ID is missing');
-
-      return res.status(500).json({
-        success: false,
-        message: 'Google authentication is not configured.',
-      });
+      throw new AppError('Google authentication is not configured.', 500);
     }
 
     // Verify Google ID token
     let payload;
-
     try {
       const ticket = await client.verifyIdToken({
-        idToken,
+        idToken, 
         audience: process.env.GOOGLE_CLIENT_ID,
       });
 
       payload = ticket.getPayload();
     } catch {
-      return res.status(401).json({
-        success: false,
-        message:
-          'Invalid Google token or authentication failed!',
-      });
+      throw new AppError('Invalid Google token or authentication failed!', 401);
     }
 
-    if (
-      !payload ||
-      !payload.email ||
-      payload.email_verified !== true
-    ) {
-      return res.status(401).json({
-        success: false,
-        message: 'Google email verification failed!',
-      });
+    if (!payload || !payload.email || payload.email_verified !== true) {
+      throw new AppError('Google email verification failed!', 401);
     }
 
     const email = normalizeEmail(payload.email);
     const emailError = validateEmail(email);
 
     if (emailError) {
-      return validationError(res, emailError);
+      throw new AppError(emailError, 400);
     }
 
     let user = await User.findOne({ email });
 
     // Register user automatically if not found
     if (!user) {
-      const name = normalizeName(
-        payload.name || 'Google User'
-      );
-
+      const name = normalizeName(payload.name || 'Google User');
       const randomPassword = randomBytes(32).toString('hex');
       const hashedPassword = await argon2.hash(randomPassword);
 
@@ -153,19 +99,7 @@ export const googleLogin = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Google Auth Error:', error.message);
-
-    if (getDuplicateKeyError(error)) {
-      return res.status(409).json({
-        success: false,
-        message: 'An account with this email already exists.',
-      });
-    }
-
-    return res.status(500).json({
-      success: false,
-      message: 'Google authentication failed. Please try again.',
-    });
+    next(error);
   }
 };
 
@@ -173,7 +107,7 @@ export const googleLogin = async (req, res) => {
 // 2. REGISTER USER & SEND OTP
 // ==========================================
 
-export const registerUser = async (req, res) => {
+export const registerUser = async (req, res, next) => {
   let pendingEmail = '';
 
   try {
@@ -185,23 +119,20 @@ export const registerUser = async (req, res) => {
 
     // Validate name
     const nameError = validateName(rawName);
-
     if (nameError) {
-      return validationError(res, nameError);
+      throw new AppError(nameError, 400);
     }
 
     // Validate email
     const emailError = validateEmail(rawEmail);
-
     if (emailError) {
-      return validationError(res, emailError);
+      throw new AppError(emailError, 400);
     }
 
     // Validate password
     const passwordError = validateNewPassword(password);
-
     if (passwordError) {
-      return validationError(res, passwordError);
+      throw new AppError(passwordError, 400);
     }
 
     const name = normalizeName(rawName);
@@ -209,13 +140,8 @@ export const registerUser = async (req, res) => {
 
     // Check existing user
     const existingUser = await User.findOne({ email });
-
     if (existingUser) {
-      return res.status(409).json({
-        success: false,
-        message:
-          'User already registered with this email!',
-      });
+      throw new AppError('User already registered with this email!', 409);
     }
 
     // Generate OTP and hash password
@@ -231,25 +157,11 @@ export const registerUser = async (req, res) => {
     pendingEmail = email;
 
     // Save OTP and temporary user for 5 minutes
-    await redisClient.set(
-      `otp:${email}`,
-      otp,
-      'EX',
-      300
-    );
-
-    await redisClient.set(
-      `temp_user:${email}`,
-      tempUserData,
-      'EX',
-      300
-    );
+    await redisClient.set(`otp:${email}`, otp, 'EX', 300);
+    await redisClient.set(`temp_user:${email}`, tempUserData, 'EX', 300);
 
     // Send OTP email
-    const htmlContent = generateOtpEmailTemplate(
-      name,
-      otp
-    );
+    const htmlContent = generateOtpEmailTemplate(name, otp);
 
     await sendEmail({
       to: email,
@@ -259,40 +171,18 @@ export const registerUser = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message:
-        'OTP successfully sent to your email. Please check your inbox.',
+      message: 'OTP successfully sent to your email. Please check your inbox.',
     });
   } catch (error) {
-    console.error('Register Error:', error.message);
-
     // Clean temporary credentials if registration fails
     if (pendingEmail) {
       try {
-        await redisClient.del(
-          `otp:${pendingEmail}`,
-          `temp_user:${pendingEmail}`
-        );
+        await redisClient.del(`otp:${pendingEmail}`, `temp_user:${pendingEmail}`);
       } catch (cleanupError) {
-        console.error(
-          'Registration cleanup error:',
-          cleanupError.message
-        );
+        console.error('Registration cleanup error:', cleanupError.message);
       }
     }
-
-    if (getDuplicateKeyError(error)) {
-      return res.status(409).json({
-        success: false,
-        message:
-          'User already registered with this email!',
-      });
-    }
-
-    return res.status(500).json({
-      success: false,
-      message:
-        'Unable to complete registration. Please try again.',
-    });
+    next(error);
   }
 };
 
@@ -300,7 +190,7 @@ export const registerUser = async (req, res) => {
 // 3. VERIFY OTP & CREATE USER
 // ==========================================
 
-export const verifyOtpAndRegister = async (req, res) => {
+export const verifyOtpAndRegister = async (req, res, next) => {
   try {
     const {
       email: rawEmail,
@@ -309,88 +199,46 @@ export const verifyOtpAndRegister = async (req, res) => {
 
     // Validate email
     const emailError = validateEmail(rawEmail);
-
     if (emailError) {
-      return validationError(res, emailError);
+      throw new AppError(emailError, 400);
     }
 
     const email = normalizeEmail(rawEmail);
 
     // OTP must be exactly 6 digits
-    if (
-      typeof rawOtp !== 'string' ||
-      !/^\d{6}$/.test(rawOtp)
-    ) {
-      return validationError(
-        res,
-        'OTP must be exactly 6 digits!'
-      );
+    if (typeof rawOtp !== 'string' || !/^\d{6}$/.test(rawOtp)) {
+      throw new AppError('OTP must be exactly 6 digits!', 400);
     }
 
     // Read OTP and temporary user data
-    const storedOtp = await redisClient.get(
-      `otp:${email}`
-    );
-
-    const storedUserData = await redisClient.get(
-      `temp_user:${email}`
-    );
+    const storedOtp = await redisClient.get(`otp:${email}`);
+    const storedUserData = await redisClient.get(`temp_user:${email}`);
 
     if (!storedOtp || !storedUserData) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'OTP expired or invalid! Please register again.',
-      });
+      throw new AppError('OTP expired or invalid! Please register again.', 400);
     }
 
     if (storedOtp !== rawOtp) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Invalid OTP! Please provide the correct OTP.',
-      });
+      throw new AppError('Invalid OTP! Please provide the correct OTP.', 400);
     }
 
     // Parse temporary user data
     let tempUser;
-
     try {
       tempUser = JSON.parse(storedUserData);
     } catch {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Registration data is invalid. Please register again.',
-      });
+      throw new AppError('Registration data is invalid. Please register again.', 400);
     }
 
-    if (
-      tempUser.email !== email ||
-      !tempUser.name ||
-      !tempUser.password
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Registration data is invalid. Please register again.',
-      });
+    if (!tempUser.email || tempUser.email !== email || !tempUser.name || !tempUser.password) {
+      throw new AppError('Registration data is invalid. Please register again.', 400);
     }
 
     // Check duplicate user again
     const existingUser = await User.findOne({ email });
-
     if (existingUser) {
-      await redisClient.del(
-        `otp:${email}`,
-        `temp_user:${email}`
-      );
-
-      return res.status(409).json({
-        success: false,
-        message:
-          'User already registered with this email!',
-      });
+      await redisClient.del(`otp:${email}`, `temp_user:${email}`);
+      throw new AppError('User already registered with this email!', 409);
     }
 
     // Password is already hashed in registerUser
@@ -401,10 +249,7 @@ export const verifyOtpAndRegister = async (req, res) => {
     });
 
     // Remove OTP and temporary data
-    await redisClient.del(
-      `otp:${email}`,
-      `temp_user:${email}`
-    );
+    await redisClient.del(`otp:${email}`, `temp_user:${email}`);
 
     return res.status(201).json({
       success: true,
@@ -416,21 +261,7 @@ export const verifyOtpAndRegister = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Verify OTP Error:', error.message);
-
-    if (getDuplicateKeyError(error)) {
-      return res.status(409).json({
-        success: false,
-        message:
-          'User already registered with this email!',
-      });
-    }
-
-    return res.status(500).json({
-      success: false,
-      message:
-        'Unable to verify OTP. Please try again.',
-    });
+    next(error);
   }
 };
 
@@ -438,7 +269,7 @@ export const verifyOtpAndRegister = async (req, res) => {
 // 4. LOGIN USER
 // ==========================================
 
-export const loginUser = async (req, res) => {
+export const loginUser = async (req, res, next) => {
   try {
     const {
       email: rawEmail,
@@ -447,47 +278,33 @@ export const loginUser = async (req, res) => {
 
     // Validate email
     const emailError = validateEmail(rawEmail);
-
     if (emailError) {
-      return validationError(res, emailError);
+      throw new AppError(emailError, 400);
     }
 
     // Validate password
     const passwordError = validateLoginPassword(password);
-
     if (passwordError) {
-      return validationError(res, passwordError);
+      throw new AppError(passwordError, 400);
     }
 
     const email = normalizeEmail(rawEmail);
 
-    const user = await User.findOne({ email }).select(
-      '+password'
-    );
+    const user = await User.findOne({ email }).select('+password');
 
     if (!user || !user.password) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid email or password!',
-      });
+      throw new AppError('Invalid email or password!', 401);
     }
 
     let isPasswordValid = false;
-
     try {
-      isPasswordValid = await argon2.verify(
-        user.password,
-        password
-      );
+      isPasswordValid = await argon2.verify(user.password, password);
     } catch {
       isPasswordValid = false;
     }
 
     if (!isPasswordValid) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid email or password!',
-      });
+      throw new AppError('Invalid email or password!', 401);
     }
 
     // Generate tokens
@@ -519,12 +336,7 @@ export const loginUser = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Login Error:', error.message);
-
-    return res.status(500).json({
-      success: false,
-      message: 'Internal Server Error',
-    });
+    next(error);
   }
 };
 
@@ -532,60 +344,36 @@ export const loginUser = async (req, res) => {
 // 5. REFRESH ACCESS TOKEN
 // ==========================================
 
-export const handleRefreshToken = async (req, res) => {
+export const handleRefreshToken = async (req, res, next) => {
   try {
     const token = req.cookies?.refreshToken;
 
     if (typeof token !== 'string' || !token) {
-      return res.status(401).json({
-        success: false,
-        message:
-          'Refresh token is required in cookie!',
-      });
+      throw new AppError('Refresh token is required in cookie!', 401);
     }
 
     let decoded;
-
     try {
-      decoded = jwt.verify(
-        token,
-        process.env.JWT_REFRESH_SECRET
-      );
+      decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
     } catch {
-      return res.status(403).json({
-        success: false,
-        message:
-          'Invalid or expired refresh token!',
-      });
+      throw new AppError('Invalid or expired refresh token!', 403);
     }
 
     if (!decoded?.id) {
-      return res.status(403).json({
-        success: false,
-        message: 'Invalid refresh token payload!',
-      });
+      throw new AppError('Invalid refresh token payload!', 403);
     }
 
     // Verify refresh token in Redis
-    const storedToken = await redisClient.get(
-      `refresh_token:${decoded.id}`
-    );
+    const storedToken = await redisClient.get(`refresh_token:${decoded.id}`);
 
     if (!storedToken || storedToken !== token) {
-      return res.status(403).json({
-        success: false,
-        message:
-          'Invalid or revoked refresh token!',
-      });
+      throw new AppError('Invalid or revoked refresh token!', 403);
     }
 
     const user = await User.findById(decoded.id);
 
     if (!user) {
-      return res.status(403).json({
-        success: false,
-        message: 'User no longer exists!',
-      });
+      throw new AppError('User no longer exists!', 403);
     }
 
     const newAccessToken = generateAccessToken(user);
@@ -595,12 +383,7 @@ export const handleRefreshToken = async (req, res) => {
       accessToken: newAccessToken,
     });
   } catch (error) {
-    console.error('Refresh Token Error:', error.message);
-
-    return res.status(500).json({
-      success: false,
-      message: 'Internal Server Error',
-    });
+    next(error);
   }
 };
 
@@ -608,22 +391,19 @@ export const handleRefreshToken = async (req, res) => {
 // 6. LOGOUT USER
 // ==========================================
 
-export const logoutUser = async (req, res) => {
+export const logoutUser = async (req, res, next) => {
   try {
     const userId = req.user?._id;
     const authorization = req.headers.authorization;
 
     const accessToken =
-      typeof authorization === 'string' &&
-      authorization.startsWith('Bearer ')
+      typeof authorization === 'string' && authorization.startsWith('Bearer ')
         ? authorization.split(' ')[1]
         : null;
 
     // Delete refresh token from Redis
     if (userId) {
-      await redisClient.del(
-        `refresh_token:${userId}`
-      );
+      await redisClient.del(`refresh_token:${userId}`);
     }
 
     // Blacklist the access token until it expires
@@ -631,11 +411,7 @@ export const logoutUser = async (req, res) => {
       const decoded = jwt.decode(accessToken);
 
       const remainingSeconds = decoded?.exp
-        ? Math.max(
-            1,
-            decoded.exp -
-              Math.floor(Date.now() / 1000)
-          )
+        ? Math.max(1, decoded.exp - Math.floor(Date.now() / 1000))
         : 900;
 
       await redisClient.set(
@@ -657,12 +433,7 @@ export const logoutUser = async (req, res) => {
       message: 'Logged out successfully!',
     });
   } catch (error) {
-    console.error('Logout Error:', error.message);
-
-    return res.status(500).json({
-      success: false,
-      message: 'Internal Server Error',
-    });
+    next(error);
   }
 };
 
@@ -670,15 +441,14 @@ export const logoutUser = async (req, res) => {
 // 7. FORGOT PASSWORD
 // ==========================================
 
-export const forgotPassword = async (req, res) => {
+export const forgotPassword = async (req, res, next) => {
   try {
     const { email: rawEmail } = req.body || {};
 
     // Validate email
     const emailError = validateEmail(rawEmail);
-
     if (emailError) {
-      return validationError(res, emailError);
+      throw new AppError(emailError, 400);
     }
 
     const email = normalizeEmail(rawEmail);
@@ -687,8 +457,7 @@ export const forgotPassword = async (req, res) => {
     // Do not reveal whether the account exists
     const genericResponse = {
       success: true,
-      message:
-        'If an account exists for this email, a password reset link will be sent.',
+      message: 'If an account exists for this email, a password reset link will be sent.',
     };
 
     if (!user) {
@@ -699,25 +468,12 @@ export const forgotPassword = async (req, res) => {
     const resetToken = randomBytes(32).toString('hex');
 
     // Store token for 15 minutes
-    await redisClient.set(
-      `reset_token:${resetToken}`,
-      user._id.toString(),
-      'EX',
-      900
-    );
+    await redisClient.set(`reset_token:${resetToken}`, user._id.toString(), 'EX', 900);
 
-    const frontendUrl = (
-      process.env.CLIENT_URL ||
-      'http://localhost:5173'
-    ).replace(/\/+$/, '');
+    const frontendUrl = (process.env.CLIENT_URL || 'http://localhost:5173').replace(/\/+$/, '');
+    const resetLink = `${frontendUrl}/reset-password?token=${resetToken}`;
 
-    const resetLink =
-      `${frontendUrl}/reset-password?token=${resetToken}`;
-
-    const htmlContent = generateResetLinkEmailTemplate(
-      user.name,
-      resetLink
-    );
+    const htmlContent = generateResetLinkEmailTemplate(user.name, resetLink);
 
     try {
       await sendEmail({
@@ -727,22 +483,13 @@ export const forgotPassword = async (req, res) => {
       });
     } catch (emailError) {
       // Remove reset token if email delivery fails
-      await redisClient.del(
-        `reset_token:${resetToken}`
-      );
-
+      await redisClient.del(`reset_token:${resetToken}`);
       throw emailError;
     }
 
     return res.status(200).json(genericResponse);
   } catch (error) {
-    console.error('Forgot Password Error:', error.message);
-
-    return res.status(500).json({
-      success: false,
-      message:
-        'Unable to process password reset. Please try again.',
-    });
+    next(error);
   }
 };
 
@@ -750,111 +497,62 @@ export const forgotPassword = async (req, res) => {
 // 8. RESET PASSWORD
 // ==========================================
 
-export const resetPassword = async (req, res) => {
+export const resetPassword = async (req, res, next) => {
   try {
     const { token } = req.params || {};
-
-    const {
-      newPassword,
-      confirmPassword,
-    } = req.body || {};
+    const { newPassword, confirmPassword } = req.body || {};
 
     // Validate reset token
-    if (
-      typeof token !== 'string' ||
-      !/^[a-f0-9]{64}$/i.test(token)
-    ) {
-      return validationError(
-        res,
-        'Invalid or expired password reset token!'
-      );
+    if (typeof token !== 'string' || !/^[a-f0-9]{64}$/i.test(token)) {
+      throw new AppError('Invalid or expired password reset token!', 400);
     }
 
     // Validate new password
-    const passwordError = validateNewPassword(
-      newPassword
-    );
-
+    const passwordError = validateNewPassword(newPassword);
     if (passwordError) {
-      return validationError(res, passwordError);
+      throw new AppError(passwordError, 400);
     }
 
     // Validate confirmation
-    if (
-      typeof confirmPassword !== 'string' ||
-      !confirmPassword.length
-    ) {
-      return validationError(
-        res,
-        'Confirm password is required!'
-      );
+    if (typeof confirmPassword !== 'string' || !confirmPassword.length) {
+      throw new AppError('Confirm password is required!', 400);
     }
 
     if (newPassword !== confirmPassword) {
-      return validationError(
-        res,
-        'New password and confirm password do not match!'
-      );
+      throw new AppError('New password and confirm password do not match!', 400);
     }
 
     // Find user ID associated with token
-    const userId = await redisClient.get(
-      `reset_token:${token}`
-    );
+    const userId = await redisClient.get(`reset_token:${token}`);
 
     if (!userId) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Invalid or expired password reset token!',
-      });
+      throw new AppError('Invalid or expired password reset token!', 400);
     }
 
-    const user = await User.findById(userId).select(
-      '+password'
-    );
+    const user = await User.findById(userId).select('+password');
 
     if (!user) {
-      await redisClient.del(
-        `reset_token:${token}`
-      );
-
-      return res.status(404).json({
-        success: false,
-        message: 'User no longer exists!',
-      });
+      await redisClient.del(`reset_token:${token}`);
+      throw new AppError('User no longer exists!', 404);
     }
 
     // Hash and update password
-    const hashedPassword = await argon2.hash(
-      newPassword
-    );
+    const hashedPassword = await argon2.hash(newPassword);
 
     user.password = hashedPassword;
     await user.save();
 
     // Make reset token single-use
-    await redisClient.del(
-      `reset_token:${token}`
-    );
+    await redisClient.del(`reset_token:${token}`);
 
     // Invalidate refresh-token session
-    await redisClient.del(
-      `refresh_token:${userId}`
-    );
+    await redisClient.del(`refresh_token:${userId}`);
 
     return res.status(200).json({
       success: true,
-      message:
-        'Password successfully reset! You can now log in with your new password.',
+      message: 'Password successfully reset! You can now log in with your new password.',
     });
   } catch (error) {
-    console.error('Reset Password Error:', error.message);
-
-    return res.status(500).json({
-      success: false,
-      message:
-        'Unable to reset password. Please try again.',
-    });
+    next(error);
   }
 };

@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import router from './routes/index.js'; // <- Central routes index import kora holo
+import { errorHandler } from './middlewares/error.middleware.js';
 
 const app = express();
 
@@ -28,5 +29,7 @@ app.get('/health', (req, res) => {
     message: 'API is running successfully with ES Modules!',
   });
 });
+
+app.use(errorHandler)
 
 export default app;
